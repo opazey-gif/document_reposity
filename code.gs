@@ -1,8 +1,56 @@
 /**
  * โครงการ: Smart PDF Governance (ระบบสารบรรณอิเล็กทรอนิกส์)
  * ผู้พัฒนา: OCTO_IT (Senior Digital Justice Architect)
- * เวอร์ชัน: 4.0 (Saraban Standalone Edition)
+ * เวอร์ชัน: 4.1.1 (Hotfix: Cache Parsing)
  */
+
+const APP_CONFIG = {
+  // 1. Web App URL ของ "Central IAM"
+  IAM_API_URL: "https://script.google.com/a/macros/tijthailand.org/s/AKfycbxIi2gY_iu_0in2NvDVU6BQS5v9vvN-uf0h5lFpfQ37o0t9JF08AG1-huOImdmtH-Xd/exec", 
+  
+  // 2. Secret Key (ต้องตรงกับฝั่ง IAM)
+  IAM_API_SECRET: "TIJ-INTERNAL-SECRET-2024",
+  
+  // 3. ชื่อ App Key ที่ลงทะเบียนไว้ใน IAM
+  APP_KEY: "smart_doc", 
+  
+  // ระยะเวลาเก็บข้อมูลสิทธิ์ใน Cache (1800 วินาที = 30 นาที)
+  CACHE_DURATION_SEC: 1800 
+};
+
+// ==========================================
+// 0. AUTH MIDDLEWARE (ตัวกั้นประตูเชื่อมกับ IAM)
+// ==========================================
+function verifyAccess() {
+  const userEmail = Session.getActiveUser().getEmail();
+  if (!userEmail) return { success: false, message: "กรุณาล็อกอินด้วยบัญชีองค์กร", app_role: "None" };
+
+  const cache = CacheService.getUserCache();
+  // เปลี่ยน Cache Key เป็น v2 เพื่อล้างค่าเดิมที่พังออกทันที
+  const cacheKey = `auth_v2_${APP_CONFIG.APP_KEY}_${userEmail}`;
+  const cachedData = cache.get(cacheKey);
+  
+  // HOTFIX: เมื่ออ่านจาก Cache ต้องคืนค่า { success: true } คู่กับ data เดิมเสมอ
+  if (cachedData) {
+    return { success: true, ...JSON.parse(cachedData) };
+  }
+  
+  try {
+    const payload = { secret: APP_CONFIG.IAM_API_SECRET, email: userEmail, app_name: APP_CONFIG.APP_KEY };
+    const options = { method: 'post', contentType: 'application/json', payload: JSON.stringify(payload), muteHttpExceptions: true };
+    const response = UrlFetchApp.fetch(APP_CONFIG.IAM_API_URL, options);
+    const result = JSON.parse(response.getContentText());
+    
+    if (result.success && result.data && result.data.is_authorized) {
+      cache.put(cacheKey, JSON.stringify(result.data), APP_CONFIG.CACHE_DURATION_SEC);
+      return { success: true, ...result.data };
+    } else {
+      return { success: false, message: result.message || "คุณไม่มีสิทธิ์เข้าใช้งานระบบนี้ กรุณาติดต่อ IT", app_role: "None" };
+    }
+  } catch (error) {
+    return { success: false, message: "ระบบส่วนกลาง (IAM) ขัดข้อง: " + error.message, app_role: "None" };
+  }
+}
 
 // ==========================================
 // AUDIT TRAIL ENGINE (Immutable Logs)
@@ -46,33 +94,46 @@ function evaluatePolicy(user, document) {
       user.project_context === document.project_context && 
       document.project_context !== "-") return true;
   if (user.role === 'Supervisor' && user.department === document.department) return true;
+  if (user.role === 'Admin' || user.role === 'Superadmin') return true; // เพิ่มสิทธิ์ให้ Admin เห็นทั้งหมด
   if (document.security_class === 'Public') return true;
   if (document.security_class === 'Internal' && user.department === document.department) return true;
   return false;
 }
 
 // ==========================================
-// IDENTITY PROVIDER (Server-Side Auth)
+// IDENTITY PROVIDER (Server-Side Auth via IAM)
 // ==========================================
 function getCurrentUserContext() {
   const email = Session.getActiveUser().getEmail() || "anonymous@public.com";
   const props = PropertiesService.getScriptProperties();
   const dbId = props.getProperty('DB_SHEET_ID');
-  if (!dbId) return { email: email, role: "Guest", department: "-", clearance_level: 0, project_context: "-" };
   
+  // 1. ตรวจสอบและดึงสิทธิ์จาก Central IAM (Source of Truth สำหรับ Role และ Dept)
+  const iamAuth = verifyAccess();
+  if (!iamAuth.success) {
+    return { email: email, role: "Guest", department: "-", clearance_level: 0, project_context: "-" };
+  }
+  
+  let context = { 
+    email: iamAuth.email || email, 
+    role: iamAuth.app_role || "User", 
+    department: iamAuth.dept || "-", 
+    clearance_level: 1, // ค่าเริ่มต้น
+    project_context: "-" 
+  };
+
+  // 2. ดึงข้อมูลสิทธิ์เฉพาะระบบ (Clearance Level/Project) จาก Table_Users ภายใน (ถ้ามี)
+  if (!dbId) return context;
   const ss = SpreadsheetApp.openById(dbId);
   const userSheet = ss.getSheetByName('Table_Users');
   
-  let context = { email: email, role: "Staff", department: "Unknown", clearance_level: 1, project_context: "-" };
-
   if (userSheet) {
     const data = userSheet.getDataRange().getValues();
     for (let i = 1; i < data.length; i++) {
-      if (data[i][0] === email) {
-        context.role = data[i][1];
-        context.department = data[i][2];
+      // จับคู่อีเมล หากพบว่ามีการให้สิทธิ์ Clearance พิเศษในระบบนี้ ให้เขียนทับเฉพาะ Clearance
+      if (data[i][0] === context.email) {
         context.clearance_level = Number(data[i][3]) || 1;
-        context.project_context = data[i][4];
+        context.project_context = data[i][4] || "-";
         break;
       }
     }
@@ -146,6 +207,22 @@ function setupEnvironment() {
 // 2. WEB APP ROUTING
 // ==========================================
 function doGet(e) {
+  // วิ่งผ่าน Middleware เพื่อตรวจสิทธิ์กับ Central IAM ทันทีที่เปิดลิงก์
+  const auth = verifyAccess();
+  
+  // หาก IAM ไม่อนุญาต ให้สกัดกั้นหน้าจอทันที (Zero Trust Architecture)
+  if (!auth.success) {
+    return HtmlService.createHtmlOutput(`
+      <div style="font-family: 'Sarabun', Tahoma, sans-serif; text-align: center; margin-top: 100px; background: #fafaf9; height: 100vh; padding-top: 50px;">
+        <h1 style="color: #ef4444; font-size: 80px; margin: 0;">🛑</h1>
+        <h2 style="color: #1e293b;">Access Denied (ปฏิเสธการเข้าถึง)</h2>
+        <p style="color: #64748b; font-size: 18px;">${auth.message}</p>
+        <p style="font-size: 12px; color: #94a3b8; margin-top: 20px;">Requested System: ${APP_CONFIG.APP_KEY}</p>
+      </div>
+    `).setTitle('Access Denied');
+  }
+
+  // หากอนุญาต ให้แสดงหน้าจอ E-Document ตามปกติ (แก้ index เป็น Index)
   return HtmlService.createHtmlOutputFromFile('Index')
     .setTitle('ระบบสารบรรณอิเล็กทรอนิกส์ (E-Document)')
     .addMetaTag('viewport', 'width=device-width, initial-scale=1')
@@ -394,6 +471,8 @@ function updateDocument(payload) {
     let canEdit = false;
     if (userContext.email === docMeta.data_owner) canEdit = true;
     else if (userContext.role === 'Supervisor' && userContext.department === docMeta.department) canEdit = true;
+    else if (userContext.role === 'Admin' || userContext.role === 'Superadmin') canEdit = true;
+    
     if (!canEdit) throw new Error("Access Denied: คุณไม่มีสิทธิ์แก้ไขเอกสารนี้");
 
     txSheet.getRange(rowIndex, 3).setValue(payload.subject); 
@@ -437,6 +516,8 @@ function archiveDocument(fileId) {
     let canDelete = false;
     if (userContext.email === docMeta.data_owner) canDelete = true;
     else if (userContext.role === 'Supervisor' && userContext.department === docMeta.department) canDelete = true;
+    else if (userContext.role === 'Admin' || userContext.role === 'Superadmin') canDelete = true;
+    
     if (!canDelete) throw new Error("Access Denied: คุณไม่มีสิทธิ์จัดเก็บเอกสารนี้");
 
     txSheet.getRange(rowIndex, 21).setValue("ARCHIVED"); 
